@@ -76,7 +76,10 @@ def time_workload(worker_count, task_count=TASK_COUNT, size=MATRIX_SIZE):
 def run_benchmark(max_workers=None):
     """Run the benchmark for 1, 2, 4, 8 ... workers.  Returns a list."""
     if max_workers is None:
-        max_workers = os.cpu_count() or 1
+        # Keep the default GUI run bounded; machines with many logical CPUs
+        # should not accidentally launch dozens/hundreds of worker processes.
+        max_workers = min(os.cpu_count() or 1, 8)
+    max_workers = max(1, min(int(max_workers), os.cpu_count() or int(max_workers)))
 
     results = []
     single_worker_time = None

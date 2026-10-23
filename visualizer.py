@@ -109,18 +109,16 @@ def plot_context_switches(ax, times, switch_increase):
 
 
 def plot_cei(ax, cei_value):
-    """Single horizontal bar showing CEI out of 100.
-
-    No GOOD/MODERATE/POOR colouring: the thresholds belong to the
-    analyzer (Palak) and are not final yet.
-    """
+    """Single horizontal CEI bar coloured by the agreed rating thresholds."""
     if cei_value is None:
-        show_message(ax, "CEI not calculated yet.")
+        show_message(ax, "CEI unavailable: no valid component scores.")
         return
 
+    rating = "GOOD" if cei_value >= 85 else "MODERATE" if cei_value >= 60 else "POOR"
+    rating_color = {"GOOD": "#218A55", "MODERATE": "#C18419", "POOR": "#B42318"}[rating]
     ax.clear()
     ax.barh(["CEI"], [100], color="#E6E6E6", height=0.4)
-    ax.barh(["CEI"], [cei_value], color=ACCENT, height=0.4)
+    ax.barh(["CEI"], [cei_value], color=rating_color, height=0.4)
     if cei_value >= 30:     # enough room: write the value inside the bar
         ax.text(2, 0, f"{cei_value:.1f} / 100", va="center",
                 color="white", fontsize=11, fontweight="bold")
@@ -132,6 +130,8 @@ def plot_cei(ax, cei_value):
     ax.set_title("Core Efficiency Index (CEI)", fontsize=11,
                  fontweight="bold")
     ax.set_xlabel("Score out of 100")
+    ax.text(99, 0.42, rating, ha="right", va="center", color=rating_color,
+            fontsize=10, fontweight="bold")
     ax.set_yticks([])
 
 

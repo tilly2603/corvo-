@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated monitoring history (created automatically at runtime)
+data/cpu_data.csv

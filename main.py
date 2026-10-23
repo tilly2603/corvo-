@@ -1,12 +1,3 @@
-"""
-main.py  -  CORVO Multi-core Processor Analyser
-
-Start the program with:   python main.py
-
-All project files must be in the same folder:
-    monitor.py, storage.py, analyzer.py, workload.py, visualizer.py, gui.py, main.py
-"""
-
 import os
 import tkinter as tk
 

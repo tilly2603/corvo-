@@ -26,6 +26,7 @@ import queue
 import random
 import threading
 import time
+from collections import deque
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -82,6 +83,10 @@ def get_dummy_data():
         "Average Threads per Process": round(random.uniform(15, 18), 2),
         "Context Switch Increase": random.randint(30000, 70000),
         "CEI": round(random.uniform(60, 90), 2),            # dummy value, not the real formula
+        "CEI Mode": "provisional",
+        "CEI Missing Components": ["C", "H", "S"],
+        "CEI Rating": "MODERATE",
+        "CEI Components": {"B": 78.0, "T": 88.0, "A": 75.0, "C": None, "H": 82.0, "S": None},
         "Recommendations": [
             "CPU workload is well distributed across cores.",
             "A sufficient number of CPU cores are active.",
@@ -173,6 +178,13 @@ class MonitorWorker:
         self.stop_event = threading.Event()
         self.thread = None
         self.previous_switches = None
+        self.previous_temperature = None
+        self.previous_cpu_usage = None
+        self.previous_process_count = None
+        self.previous_thread_count = None
+        self.previous_cei = None
+        self.core_samples = deque(maxlen=3)
+        self.benchmark_results = []
 
     def start(self):
         self.stop_event.clear()
@@ -202,18 +214,44 @@ class MonitorWorker:
         """One reading: monitor -> analyzer -> CSV.  Returns the data dict."""
         snapshot = monitor.get_system_snapshot()
 
+        self.core_samples.append(snapshot["Core Usage"])
+        # Smooth short-lived spikes by averaging the latest three core samples.
+        sample_count = len(self.core_samples)
+        smoothed_cores = [
+            sum(sample[i] for sample in self.core_samples) / sample_count
+            for i in range(len(snapshot["Core Usage"]))
+        ] if all(len(sample) == len(snapshot["Core Usage"]) for sample in self.core_samples) else snapshot["Core Usage"]
         analysis = analyzer.analyze_system(
-            snapshot["Core Usage"],
+            smoothed_cores,
             snapshot["Threads"],
             snapshot["Processes"],
             snapshot["Context Switches"],
-            self.previous_switches
+            self.previous_switches,
+            cpu_usage=snapshot["CPU Usage"],
+            temperature=snapshot["Temperature"],
+            benchmark_results=self.benchmark_results,
+            logical_cores=snapshot["Logical Cores"],
+            previous_temperature=self.previous_temperature,
+            previous_cpu_usage=self.previous_cpu_usage,
+            previous_process_count=self.previous_process_count,
+            previous_thread_count=self.previous_thread_count,
+            previous_cei=self.previous_cei,
         )
         self.previous_switches = snapshot["Context Switches"]
+        self.previous_temperature = snapshot["Temperature"]
+        self.previous_cpu_usage = snapshot["CPU Usage"]
+        self.previous_process_count = snapshot["Processes"]
+        self.previous_thread_count = snapshot["Threads"]
+        self.previous_cei = analysis["CEI"]
 
         data = dict(snapshot)
         data.update(analysis)
         data["Save Error"] = self.save_row(snapshot)
+        if data["Save Error"]:
+            data["Recommendations"].insert(0,
+                "Monitoring data could not be saved [MEDIUM priority]\n"
+                f"Evidence: {data['Save Error']}\n"
+                "Suggested solutions: Close the CSV in spreadsheet software; check write permissions; retry after resolving the file issue.")
         return data
 
     def save_row(self, snapshot):
@@ -265,7 +303,11 @@ def set_text(text_widget, lines):
     text_widget.config(state="normal")
     text_widget.delete("1.0", "end")
     for line in lines:
-        text_widget.insert("end", "\u2022  " + line + "\n")
+        parts = str(line).splitlines() or [str(line)]
+        text_widget.insert("end", "\u2022  " + parts[0] + "\n")
+        for part in parts[1:]:
+            text_widget.insert("end", "    " + part + "\n")
+        text_widget.insert("end", "\n")
     text_widget.config(state="disabled")
 
 
@@ -306,6 +348,8 @@ class CorvoApp:
         self.benchmark_running = False
         self.benchmark_queue = queue.Queue()
         self.benchmark_results = []
+        self.cei_before_benchmark = None
+        self.awaiting_benchmark_cei = False
 
         self.times = []
         self.cpu_history = []
@@ -405,7 +449,11 @@ class CorvoApp:
         right = tk.Frame(body, bg=BG)
         right.grid(row=0, column=1, sticky="nsew", padx=5)
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(2, weight=1)
+        # Reserve visible space for recommendation cards instead of letting the
+        # analysis panel consume nearly the entire vertical area.
+        right.rowconfigure(0, weight=0)
+        right.rowconfigure(1, weight=0)
+        right.rowconfigure(2, weight=1, minsize=220)
 
         # CEI
         cei_panel, cei = make_panel(right, "Core Efficiency Index")
@@ -417,36 +465,63 @@ class CorvoApp:
         self.cei_bar = ttk.Progressbar(cei, maximum=100, length=300,
                                        style="CEI.Horizontal.TProgressbar")
         self.cei_bar.pack(fill="x", pady=6)
-        self.cei_status = tk.Label(cei, text="Status: Awaiting CEI thresholds",
+        self.cei_status = tk.Label(cei, text="Status: Waiting for measurements",
                                    font=(FONT, 10), fg=MUTED, bg=CARD_BG)
         self.cei_status.pack(anchor="w")
 
         # Analysis
         analysis_panel, analysis = make_panel(right, "Analysis")
         analysis_panel.grid(row=1, column=0, sticky="ew", pady=8)
-        analysis.columnconfigure(1, weight=1)
+        for column in (1, 3):
+            analysis.columnconfigure(column, weight=1)
         self.analysis_values = {}
-        items = [("Core Balance", "Core Balance"),
+        items = [("Core Balance", "Core Balance (B)"),
                  ("Active Cores", "Active Cores"),
                  ("Idle Cores", "Idle Cores"),
                  ("Average Threads per Process", "Avg Threads / Process"),
-                 ("Context Switch Increase", "Context Switch Increase")]
-        for r, (key, title) in enumerate(items):
-            tk.Label(analysis, text=title, font=(FONT, 10), fg=MUTED,
-                     bg=CARD_BG).grid(row=r, column=0, sticky="w", pady=1)
-            value = tk.Label(analysis, text="--", font=(FONT, 10, "bold"),
+                 ("Context Switch Increase", "Context Switch Increase"),
+                 ("Component B", "B · Core balance (25%)"),
+                 ("Component T", "T · Thread distribution (20%)"),
+                 ("Component A", "A · Active/idle efficiency (15%)"),
+                 ("Component C", "C · Context switching (15%)"),
+                 ("Component H", "H · Thermal efficiency (10%)"),
+                 ("Component S", "S · Benchmark scalability (15%)")]
+        # Two compact label/value groups reduce the analysis panel height and
+        # leave useful space for the recommendation cards below it.
+        split = (len(items) + 1) // 2
+        for index, (key, title) in enumerate(items):
+            if index < split:
+                r, label_col, value_col = index, 0, 1
+            else:
+                r, label_col, value_col = index - split, 2, 3
+            tk.Label(analysis, text=title, font=(FONT, 9), fg=MUTED,
+                     bg=CARD_BG).grid(row=r, column=label_col, sticky="w", padx=(0, 6), pady=1)
+            value = tk.Label(analysis, text="--", font=(FONT, 9, "bold"),
                              fg=TEXT, bg=CARD_BG)
-            value.grid(row=r, column=1, sticky="e", pady=1)
+            value.grid(row=r, column=value_col, sticky="e", padx=(0, 12), pady=1)
             self.analysis_values[key] = value
 
-        # Recommendations
-        rec_panel, rec = make_panel(right, "Recommendations")
+        # Recommendations: each item has its own action button and opens a
+        # dedicated window with evidence, possible causes, solutions and actions.
+        rec_panel, rec = make_panel(right, "Recommendations · choose an action")
         rec_panel.grid(row=2, column=0, sticky="nsew")
-        self.rec_text = tk.Text(rec, height=6, wrap="word", font=(FONT, 10),
-                                bg=CARD_BG, fg=TEXT, relief="flat",
-                                state="disabled", cursor="arrow")
-        self.rec_text.pack(fill="both", expand=True)
-        set_text(self.rec_text, ["No analysis yet."])
+        self.rec_canvas = tk.Canvas(rec, bg=CARD_BG, highlightthickness=0, height=190)
+        rec_scroll = ttk.Scrollbar(rec, orient="vertical", command=self.rec_canvas.yview)
+        self.rec_cards_frame = tk.Frame(self.rec_canvas, bg=CARD_BG)
+        self.rec_cards_frame.bind(
+            "<Configure>", lambda _event: self.rec_canvas.configure(
+                scrollregion=self.rec_canvas.bbox("all")))
+        self.rec_window_id = self.rec_canvas.create_window(
+            (0, 0), window=self.rec_cards_frame, anchor="nw")
+        self.rec_canvas.bind(
+            "<Configure>",
+            lambda event: self.rec_canvas.itemconfigure(
+                self.rec_window_id, width=event.width))
+        self.rec_canvas.configure(yscrollcommand=rec_scroll.set)
+        self.rec_canvas.pack(side="left", fill="both", expand=True)
+        rec_scroll.pack(side="right", fill="y")
+        self.rec_canvas.bind_all("<MouseWheel>", self._scroll_recommendations, add="+")
+        self.render_recommendations(["No analysis yet. Start monitoring to generate recommendations."])
 
     def build_buttons(self):
         bar = tk.Frame(self.root, bg=BG)
@@ -469,16 +544,29 @@ class CorvoApp:
             ("Core Graph", self.show_core_graph),
             ("Temperature Graph", self.show_temperature_graph),
             ("Context Switches", self.show_switch_graph),
-            ("View Analysis", self.view_analysis),
         ]
         for text, command in graph_buttons:
             ttk.Button(bar, text=text, style="Corvo.TButton",
                        command=command).pack(side="left", padx=4)
 
-        self.benchmark_button = ttk.Button(bar, text="Run Benchmark",
+        ttk.Label(bar, text="Workers:").pack(side="left", padx=(8, 2))
+        self.worker_count_var = tk.StringVar(value="4")
+        self.worker_count_box = ttk.Combobox(bar, textvariable=self.worker_count_var,
+                                             values=("1", "2", "4", "8"), width=4,
+                                             state="readonly")
+        self.worker_count_box.pack(side="left", padx=3)
+        self.action_benchmark_button = ttk.Button(bar, text="Test Selected Workers",
+                                                  style="Corvo.TButton",
+                                                  command=self.start_selected_benchmark)
+        self.action_benchmark_button.pack(side="left", padx=4)
+        self.benchmark_button = ttk.Button(bar, text="Run Full Benchmark",
                                            style="Corvo.TButton",
                                            command=self.start_benchmark)
         self.benchmark_button.pack(side="left", padx=4)
+
+        # Keep the full analysis window at the far right, as requested.
+        ttk.Button(bar, text="View Analysis", style="Corvo.TButton",
+                   command=self.view_analysis).pack(side="left", padx=4)
 
     # ----- start / stop ------------------------------------------
     def start_monitoring(self):
@@ -546,6 +634,16 @@ class CorvoApp:
     # ----- handling one new reading ------------------------------
     def handle_new_data(self, data):
         self.latest = data
+        benchmark_comparison = None
+        if self.awaiting_benchmark_cei and data.get("CEI") is not None:
+            before = self.cei_before_benchmark
+            after = data["CEI"]
+            if before is not None:
+                delta = after - before
+                benchmark_comparison = (
+                    f"Benchmark CEI comparison: {before:.2f} → {after:.2f} "
+                    f"({delta:+.2f}); S is now included if valid.")
+            self.awaiting_benchmark_cei = False
 
         self.times.append(data["Time"])
         self.cpu_history.append(data["CPU Usage"])
@@ -556,6 +654,8 @@ class CorvoApp:
             del history[:-HISTORY_LIMIT]                   # keep the newest only
 
         self.update_display(data)
+        if benchmark_comparison:
+            self.notice_label.config(text=benchmark_comparison)
         for refresh in list(self.graph_refreshers):        # open graphs
             refresh()
 
@@ -580,9 +680,21 @@ class CorvoApp:
 
         # CEI (shown exactly as calculated by the analyzer)
         cei = data["CEI"]
-        self.cei_label.config(text=f"CEI: {cei:.2f} / 100")
-        self.cei_bar["value"] = cei
-        self.cei_status.config(text="Status: Awaiting CEI thresholds")
+        rating = data.get("CEI Rating", "N/A")
+        if cei is None:
+            self.cei_label.config(text="CEI: N/A")
+            self.cei_bar["value"] = 0
+            self.cei_status.config(text="No valid component measurements", fg=MUTED)
+        else:
+            colors = {"GOOD": GREEN, "MODERATE": "#A66A00", "POOR": RED}
+            color = colors.get(rating, ACCENT)
+            self.cei_label.config(text=f"CEI: {cei:.2f} / 100", fg=color)
+            self.cei_bar["value"] = cei
+            self.setup_cei_color(color)
+            mode = data.get("CEI Mode", "provisional").upper()
+            missing = data.get("CEI Missing Components", [])
+            missing_names = ", ".join(missing) if missing else "none"
+            self.cei_status.config(text=f"{rating} · {mode} score · excluded: {missing_names}", fg=color)
 
         # Analysis numbers
         self.analysis_values["Core Balance"].config(
@@ -592,16 +704,152 @@ class CorvoApp:
         self.analysis_values["Idle Cores"].config(text=str(data["Idle Cores"]))
         self.analysis_values["Average Threads per Process"].config(
             text=f"{data['Average Threads per Process']:.2f}")
+        switch_value = data["Context Switch Increase"]
         self.analysis_values["Context Switch Increase"].config(
-            text=f"{data['Context Switch Increase']:,}")
+            text=(f"{switch_value:,}" if switch_value is not None else "Waiting for baseline"))
+        component_scores = data.get("CEI Components", {})
+        for key, symbol in [("Component B", "B"), ("Component T", "T"),
+                            ("Component A", "A"), ("Component C", "C"),
+                            ("Component H", "H"), ("Component S", "S")]:
+            score = component_scores.get(symbol)
+            self.analysis_values[key].config(text=(f"{score:.1f}/100" if score is not None else "N/A"))
 
-        # Recommendations
-        set_text(self.rec_text, data["Recommendations"])
+        # Recommendations: cards with a dedicated "Work on this" button.
+        self.render_recommendations(data.get("Recommendations", []))
 
         # Warning (for example: CSV could not be saved)
         save_error = data.get("Save Error")
         self.notice_label.config(text=save_error if save_error
                                  else self.notice_base)
+
+    def _scroll_recommendations(self, event):
+        """Allow mouse-wheel scrolling when the pointer is over recommendations."""
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        if widget is None:
+            return
+        current = widget
+        while current is not None:
+            if current is self.rec_canvas or current is self.rec_cards_frame:
+                self.rec_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                return
+            current = getattr(current, "master", None)
+
+    @staticmethod
+    def _recommendation_fields(recommendation):
+        """Parse the recommendation text produced by analyzer.py."""
+        lines = str(recommendation).splitlines()
+        title = lines[0] if lines else "Recommendation"
+        fields = {"title": title, "evidence": "Not available", "cause": "Not established",
+                  "solutions": [], "action": None, "raw": str(recommendation)}
+        for line in lines[1:]:
+            if line.startswith("Evidence:"):
+                fields["evidence"] = line.split(":", 1)[1].strip()
+            elif line.startswith("Possible cause:"):
+                fields["cause"] = line.split(":", 1)[1].strip()
+            elif line.startswith("Suggested solutions:"):
+                fields["solutions"] = [x.strip() for x in line.split(":", 1)[1].split(";") if x.strip()]
+            elif line.startswith("Available action:"):
+                fields["action"] = line.split(":", 1)[1].strip()
+        return fields
+
+    def render_recommendations(self, recommendations):
+        """Render compact recommendation cards, each with its own work button."""
+        for widget in self.rec_cards_frame.winfo_children():
+            widget.destroy()
+        if not recommendations:
+            recommendations = ["No recommendations are available yet."]
+        for index, recommendation in enumerate(recommendations):
+            item = self._recommendation_fields(recommendation)
+            card = tk.Frame(self.rec_cards_frame, bg="#F7F9FB", highlightbackground=BORDER,
+                            highlightthickness=1, padx=9, pady=7)
+            card.pack(fill="x", padx=2, pady=4)
+            row = tk.Frame(card, bg="#F7F9FB")
+            row.pack(fill="x")
+            title = item["title"]
+            priority_color = RED if "HIGH" in title.upper() else ("#A66A00" if "MEDIUM" in title.upper() else ACCENT)
+            tk.Label(row, text=title, font=(FONT, 10, "bold"), fg=TEXT,
+                     bg="#F7F9FB", anchor="w", justify="left", wraplength=430).pack(
+                         side="left", fill="x", expand=True)
+            ttk.Button(row, text="Work on this", style="Corvo.TButton",
+                       command=lambda data=item: self.open_recommendation_window(data)).pack(
+                           side="right", padx=(8, 0))
+            tk.Label(card, text=item["evidence"], font=(FONT, 9), fg=MUTED,
+                     bg="#F7F9FB", anchor="w", justify="left", wraplength=600).pack(
+                         fill="x", pady=(4, 0))
+
+    def open_recommendation_window(self, item):
+        """Show the full diagnosis and launch relevant safe actions."""
+        window = tk.Toplevel(self.root)
+        window.title("CORVO - Work on recommendation")
+        window.geometry("680x620")
+        window.minsize(560, 480)
+        window.configure(bg=BG)
+        window.transient(self.root)
+
+        outer = tk.Frame(window, bg=BG, padx=18, pady=16)
+        outer.pack(fill="both", expand=True)
+        tk.Label(outer, text=item["title"], font=(FONT, 16, "bold"),
+                 fg=TEXT, bg=BG, anchor="w", justify="left", wraplength=620).pack(fill="x", pady=(0, 12))
+
+        def section(label, value):
+            tk.Label(outer, text=label, font=(FONT, 10, "bold"), fg=ACCENT,
+                     bg=BG, anchor="w").pack(fill="x", pady=(7, 2))
+            tk.Label(outer, text=value or "Not available", font=(FONT, 10), fg=TEXT,
+                     bg=BG, anchor="w", justify="left", wraplength=620).pack(fill="x")
+
+        section("What CORVO observed", item["evidence"])
+        section("Possible cause (not a confirmed diagnosis)", item["cause"])
+        tk.Label(outer, text="Recommended steps", font=(FONT, 10, "bold"),
+                 fg=ACCENT, bg=BG, anchor="w").pack(fill="x", pady=(12, 3))
+        steps = item["solutions"] or ["Continue monitoring and collect more measurements."]
+        for number, solution in enumerate(steps, 1):
+            tk.Label(outer, text=f"{number}. {solution}", font=(FONT, 10), fg=TEXT,
+                     bg=BG, anchor="w", justify="left", wraplength=620).pack(fill="x", pady=2)
+        if item["action"]:
+            section("Available action", item["action"])
+
+        action_bar = tk.Frame(outer, bg=BG)
+        action_bar.pack(fill="x", side="bottom", pady=(16, 0))
+        title_lower = item["title"].lower()
+        action_lower = (item["action"] or "").lower()
+        solutions_lower = " ".join(steps).lower()
+        benchmark_relevant = any(word in title_lower + " " + action_lower + " " + solutions_lower
+                                 for word in ("benchmark", "worker", "scalability", "parallel", "thread", "core utilization"))
+        graph_relevant = any(word in title_lower for word in ("cpu", "core", "context switch", "temperature", "thermal"))
+
+        if benchmark_relevant:
+            ttk.Button(action_bar, text="Run selected-worker test", style="Start.TButton",
+                       command=lambda: self._launch_recommendation_benchmark(window)).pack(side="left", padx=(0, 8))
+        if graph_relevant:
+            graph_name = "temperature" if any(w in title_lower for w in ("temperature", "thermal")) else (
+                "switch" if "context switch" in title_lower else ("core" if "core" in title_lower else "cpu"))
+            ttk.Button(action_bar, text="Open relevant graph", style="Corvo.TButton",
+                       command=lambda name=graph_name: self._open_recommendation_graph(name)).pack(side="left", padx=(0, 8))
+        ttk.Button(action_bar, text="Close", style="Corvo.TButton",
+                   command=window.destroy).pack(side="right")
+
+    def _launch_recommendation_benchmark(self, window):
+        """Run the selected-worker benchmark after the user's explicit click."""
+        if self.benchmark_running:
+            messagebox.showinfo("CORVO", "A benchmark is already running.", parent=window)
+            return
+        window.destroy()
+        self.start_selected_benchmark()
+
+    def _open_recommendation_graph(self, graph_name):
+        if graph_name == "temperature":
+            self.show_temperature_graph()
+        elif graph_name == "switch":
+            self.show_switch_graph()
+        elif graph_name == "core":
+            self.show_core_graph()
+        else:
+            self.show_cpu_graph()
+
+    def setup_cei_color(self, color):
+        style = ttk.Style()
+        style.configure("CEI.Horizontal.TProgressbar", background=color,
+                        lightcolor=color, darkcolor=color)
 
     def update_core_rows(self, core_usage):
         """One row per core: name, progress bar, percentage."""
@@ -676,6 +924,8 @@ class CorvoApp:
         """Run workload.run_benchmark() in its own thread (it takes a while)."""
         if self.benchmark_running:
             return
+        self.cei_before_benchmark = self.latest.get("CEI") if self.latest else None
+        self.awaiting_benchmark_cei = self.latest is not None
         self.benchmark_running = True
         self.benchmark_button.config(state="disabled")
         self.notice_label.config(text="Benchmark running... please wait")
@@ -709,7 +959,76 @@ class CorvoApp:
             messagebox.showerror("CORVO", "Benchmark failed:\n" + content)
             return
         self.benchmark_results = content
+        if self.worker is not None:
+            self.worker.benchmark_results = self.benchmark_results
         self.show_benchmark_graph()
+        if self.latest is not None:
+            self.notice_label.config(text="Benchmark complete. Waiting for the next monitoring sample to compare CEI with the updated scalability score.")
+
+    def start_selected_benchmark(self):
+        """Run a user-selected worker count and compare it with the 1-worker baseline."""
+        if self.benchmark_running:
+            return
+        try:
+            workers = int(self.worker_count_var.get())
+            max_workers = __import__("os").cpu_count() or 1
+            if workers < 1 or workers > max_workers:
+                raise ValueError(f"Choose between 1 and {max_workers} workers on this machine.")
+        except ValueError as error:
+            messagebox.showwarning("CORVO", str(error))
+            return
+        self.benchmark_running = True
+        self.benchmark_button.config(state="disabled")
+        self.action_benchmark_button.config(state="disabled")
+        self.notice_label.config(text=f"Testing benchmark with {workers} worker(s)...")
+        threading.Thread(target=self.selected_benchmark_thread, args=(workers,), daemon=True).start()
+        self.check_selected_benchmark()
+
+    def selected_benchmark_thread(self, workers):
+        try:
+            seconds = workload.time_workload(workers)
+            self.benchmark_queue.put(("selected", {"Workers": workers, "Time": seconds}))
+        except Exception as error:
+            self.benchmark_queue.put(("error", str(error)))
+
+    def check_selected_benchmark(self):
+        try:
+            kind, content = self.benchmark_queue.get_nowait()
+        except queue.Empty:
+            self.root.after(300, self.check_selected_benchmark)
+            return
+        self.benchmark_running = False
+        self.benchmark_button.config(state="normal")
+        self.action_benchmark_button.config(state="normal")
+        if kind == "error":
+            messagebox.showerror("CORVO", "Selected-worker benchmark failed:\n" + content)
+            self.notice_label.config(text=self.notice_base)
+            return
+        if kind == "done":
+            # A full-sweep result may have reached this queue; preserve existing behaviour.
+            self.benchmark_results = content
+            if self.worker is not None:
+                self.worker.benchmark_results = content
+            self.show_benchmark_graph()
+            return
+        workers = content["Workers"]
+        seconds = content["Time"]
+        baseline = next((row for row in self.benchmark_results if row.get("Workers") == 1), None)
+        if baseline:
+            speedup = baseline["Time"] / seconds if seconds else 0
+            change = ((baseline["Time"] - seconds) / baseline["Time"] * 100) if baseline["Time"] else 0
+            message = (f"Selected-worker benchmark\n\nWorkers: {workers}\n"
+                       f"Elapsed time: {seconds:.2f} s\n"
+                       f"1-worker baseline: {baseline['Time']:.2f} s\n"
+                       f"Speedup vs baseline: {speedup:.2f}x\n"
+                       f"Elapsed-time improvement: {change:+.1f}%\n\n"
+                       "This compares CORVO's benchmark workload only; it does not reconfigure other applications.")
+        else:
+            message = (f"Selected-worker benchmark completed\n\nWorkers: {workers}\n"
+                       f"Elapsed time: {seconds:.2f} s\n\n"
+                       "Run the full benchmark to establish a 1-worker baseline and compare scalability.")
+        self.notice_label.config(text=f"Benchmark complete: {workers} worker(s), {seconds:.2f}s")
+        messagebox.showinfo("CORVO - Before/After Benchmark", message)
 
     def show_benchmark_graph(self):
         self.open_graph("Benchmark", lambda ax: visualizer.plot_benchmark(
@@ -728,9 +1047,13 @@ class CorvoApp:
                 f"Highest CPU usage: {max(self.cpu_history):.1f} %",
                 f"Lowest CPU usage: {min(self.cpu_history):.1f} %",
                 "",
-                f"Latest CEI: {data['CEI']:.2f} / 100",
+                f"Latest CEI: {data['CEI']:.2f} / 100" if data["CEI"] is not None else "Latest CEI: N/A",
+                f"CEI rating: {data.get('CEI Rating', 'N/A')} ({data.get('CEI Mode', 'unknown')})",
+                f"Excluded components: {', '.join(data.get('CEI Missing Components', [])) or 'none'}",
                 f"Core balance: {data['Core Balance']:.2f}",
                 f"Active / idle cores: {data['Active Cores']} / {data['Idle Cores']}",
+                "Component scores:",
+                *[f"  {key}: {value if value is not None else 'N/A'}" for key, value in data.get('CEI Components', {}).items()],
                 "",
                 "Recommendations:",
             ]
